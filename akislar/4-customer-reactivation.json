@@ -1,0 +1,299 @@
+{
+  "name": "Customer Reactivation",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Customer Reactivation\nReads \"dormant\" customers (no visit for months) from Google Sheets, filters the ones worth contacting, has the model draft a short personal message for each, saves the drafts back to the sheet and sends a Telegram summary. Drafts are reviewed by a human before sending.\n**Plug in:** OpenAI, Google Sheets credentials, YOUR_GOOGLE_SHEET_ID, YOUR_TELEGRAM_CHAT_ID.\n**Test:** trigger the webhook with a few sample rows in the sheet.",
+        "height": 300,
+        "width": 520
+      },
+      "id": "note-reactivation",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reactivation",
+        "responseMode": "lastNode",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "name": "Run",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "id": "cde7d609-03e8-43ec-bfa7-e26adaa0c575"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Dormant Patients",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "name": "Read Dormant",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        220,
+        300
+      ],
+      "id": "e0bdab5f-6816-451b-b39b-979a0d2c3f0e"
+    },
+    {
+      "parameters": {
+        "jsCode": "const _k=(($('Run').item.json.query)||{}).key;\nif(_k!=='YOUR_WEBHOOK_KEY'){ return []; }\n\nconst force = !!(($('Run').item.json.body||{}).force);\nconst now = new Date();\nconst styles = [\n  'lead with something concrete about their specific treatment',\n  'lead with the practical reason they are about due for a visit',\n  'lead with a warm, specific one-line opener about them, no pleasantry',\n  'keep it very short and easy - one clear reason plus an easy way to book'\n];\nconst SYSTEM = [\n'You write ONE short re-engagement message from Birchgrove Dental (a dental practice in Cardiff) to a FORMER patient who has not been in for a while. It must read like a real person at the practice wrote it just for them - never a mass campaign.',\n'RULES:',\n'- Plain British English, plain text, 2 to 3 short sentences, WhatsApp length.',\n'- OPEN with something specific to THEM: their name then a concrete hook tied to their last treatment or a genuine reason to come in. Do NOT open with a pleasantry.',\n'- BANNED phrases, never use any of these or close variants: \"hope you\\u2019re doing well\", \"hope you are well\", \"just wanted to check in\", \"it\\u2019s been a while\", \"we miss you\", \"just thinking about\", \"reaching out\", \"touch base\", \"how have you been\".',\n'- Warm, low-key, no pressure, no guilt.',\n'- NEVER invent facts: no discounts, offers, prices, urgency, or medical claims, and nothing about their teeth or their last visit date you cannot know.',\n'- End with a light, concrete invitation (book or reply), then on a NEW line exactly: Reply STOP to opt out.',\n'- Sign off on a new line: Birchgrove Dental',\n'',\n'Two examples of the right tone and variety. Do NOT reuse their wording - write fresh for this patient:',\n'Example A: \"Hi Priya - with Invisalign it is worth a quick review now and again to make sure everything is still tracking nicely. If you would like, I can find you a slot.\\nReply STOP to opt out.\\nBirchgrove Dental\"',\n'Example B: \"Hi Tom, you are probably about due for your next check-up with us. Happy to book you in whenever suits - just reply with a day that works.\\nReply STOP to opt out.\\nBirchgrove Dental\"',\n'',\n'Return strict JSON: {\"message\": string}.'\n].join('\\n');\nconst out = []; let i = 0;\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (String(r['Opt In']||'').toLowerCase().trim() !== 'yes') continue;\n  if (!force && String(r['Status']||'').trim() !== '') continue;\n  const lv = new Date(r['Last Visit']);\n  const months = isNaN(lv.getTime()) ? 12 : Math.round((now - lv)/(1000*60*60*24*30.44));\n  if (months < 6) continue;\n  const first = String(r['Name']||'').trim().split(/\\s+/)[0];\n  const user = 'Patient first name: ' + first + '\\nLast treatment: ' + r['Last Treatment'] +\n    '\\nRoughly ' + months + ' months since last visit.\\nApproach for this one: ' + styles[i % styles.length];\n  out.push({ json: { row_number: r.row_number, Name: r['Name'], systemPrompt: SYSTEM, userPrompt: user } });\n  i++;\n}\nreturn out;\n"
+      },
+      "name": "Filter Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "6df93bc0-9cdc-4d37-9ee3-08e844915aa8"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model:\"gpt-4o-mini\", response_format:{type:\"json_object\"}, temperature:0.85, messages:[{role:\"system\",content:$json.systemPrompt},{role:\"user\",content:$json.userPrompt}] }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Draft Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "id": "011e13e5-2837-43f3-96bb-8bd3fccf9973"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Per item: pull the drafted message; re-attach patient context via paired item.\nconst raw = ($json.choices && $json.choices[0] && $json.choices[0].message && $json.choices[0].message.content) || '{}';\nlet m = ''; try { m = (JSON.parse(raw).message || '').trim(); } catch (e) {}\nconst c = $('Filter Candidates').item.json;\nreturn { json: { row_number: c.row_number, Name: c.Name, message: m } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "name": "Extract Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "4a5dfc05-3903-47b9-bb2e-aa1624df1f26"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Dormant Patients",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "Reactivation Message": "={{ $json.message }}",
+            "Status": "Drafted",
+            "Drafted At": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true,
+              "removed": false
+            },
+            {
+              "id": "Reactivation Message",
+              "displayName": "Reactivation Message",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true,
+              "removed": false
+            },
+            {
+              "id": "Drafted At",
+              "displayName": "Drafted At",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true,
+              "removed": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Save Draft",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1100,
+        300
+      ],
+      "id": "588ec4be-e36d-4fa3-a206-8dd3df7e0639"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst drafted = $('Extract Message').all();\nconst lines = drafted.map(d => '• ' + d.json.Name + ': ' + (d.json.message||'').slice(0,60) + '…').join('\\n');\nreturn [{ json: { report: '🔁 <b>REACTIVATION</b> — ' + drafted.length + ' personalised message drafts ready (sheet: Dormant Patients)\\n' + lines } }];\n"
+      },
+      "name": "Summarize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "id": "6f36e7e9-e63b-40ec-a8d8-2a80a33c1fcb"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        300
+      ],
+      "id": "e3cfcb36-83c1-4c9b-9932-dda2ede3f0c3"
+    }
+  ],
+  "connections": {
+    "Run": {
+      "main": [
+        [
+          {
+            "node": "Read Dormant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Dormant": {
+      "main": [
+        [
+          {
+            "node": "Filter Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Candidates": {
+      "main": [
+        [
+          {
+            "node": "Draft Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Message": {
+      "main": [
+        [
+          {
+            "node": "Extract Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Message": {
+      "main": [
+        [
+          {
+            "node": "Save Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Draft": {
+      "main": [
+        [
+          {
+            "node": "Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize": {
+      "main": [
+        [
+          {
+            "node": "Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
