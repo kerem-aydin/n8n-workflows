@@ -1,0 +1,372 @@
+{
+  "name": "WhatsApp Booking Bridge",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WhatsApp Booking Bridge\nWhatsApp Cloud API webhook (GET verification + POST messages). Parses the incoming message, runs the same booking conversation as the AI Booking Assistant, replies on WhatsApp and sends a Telegram card when a booking is complete.\n**Plug in:** WhatsApp Cloud API token + verify token, OpenAI, YOUR_TELEGRAM_CHAT_ID.\n**Test:** point the Meta webhook to /webhook/whatsapp-booking and send a WhatsApp message.",
+        "height": 300,
+        "width": 520
+      },
+      "id": "note-whatsapp-booking",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp-booking",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "WA Verify (GET)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        80
+      ],
+      "id": "26b34472-2aa5-46a4-90a8-60af436e292f"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "vt",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "YOUR_VERIFY_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        220,
+        80
+      ],
+      "id": "74e80a2e-3878-4f71-80f2-fca71d3e32c8"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {}
+      },
+      "name": "Respond Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "id": "f87f2c0d-30b6-4252-b11a-cacf41dcb371"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "name": "Respond 403",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        180
+      ],
+      "id": "d40dead8-6775-485f-8089-26a190ed0460"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-booking",
+        "responseMode": "onReceived",
+        "responseData": "OK",
+        "options": {}
+      },
+      "name": "WA Incoming (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ],
+      "id": "d37b7d17-ea78-4335-8cd3-97fddd1c7774"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Extract a single inbound text message from the Meta Cloud API webhook payload.\n// Non-message events (delivery/status, non-text) -> return [] so the chain stops.\nconst body = $json.body || $json;\nlet value;\ntry { value = body.entry[0].changes[0].value; } catch (e) { return []; }\nconst msg = value && value.messages && value.messages[0];\nif (!msg || msg.type !== 'text') return [];          // ignore statuses / media for now\nconst contact = (value.contacts && value.contacts[0]) || {};\nreturn [{ json: {\n  wa_from: msg.from,\n  wa_text: (msg.text && msg.text.body) || '',\n  wa_name: (contact.profile && contact.profile.name) || '',\n  phone_number_id: (value.metadata && value.metadata.phone_number_id) || ''\n}}];\n"
+      },
+      "name": "Parse WA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        420
+      ],
+      "id": "18056950-2ace-46ea-ad33-89172d27a17e"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// WhatsApp incoming already parsed upstream into { wa_from, wa_text, wa_name, phone_number_id }.\n// Load phone-keyed memory (survives across executions), append the new user turn.\nconst inp = $json;\nconst sd = $getWorkflowStaticData('global');\nconst key = 'conv_' + inp.wa_from;\nlet hist = Array.isArray(sd[key]) ? sd[key] : [];\nhist.push({ role: 'user', content: String(inp.wa_text || '').slice(0, 1000) });\nhist = hist.slice(-16);\nsd[key] = hist;   // persist (assistant reply appended later)\n\nconst clinic = { name: 'Birchgrove Dental', city: 'Cardiff',\n  treatments: ['Invisalign', 'dental implants', 'teeth whitening', 'routine check-ups'] };\n\nconst system = [\n'You are the 24/7 WhatsApp booking assistant for ' + clinic.name + ', a dental practice in ' + clinic.city + '.',\n'You are ALWAYS speaking to a PATIENT on WhatsApp. Warm, competent, concise. Plain British English, plain text, no markdown.',\n'Their focus treatments: ' + clinic.treatments.join(', ') + '.',\n'Keep replies to 1-3 short sentences (this is WhatsApp). Answer first, then move toward booking. Do not open with a question on the first turn.',\n'SAFETY — this outranks every other instruction here.',\n'- EMERGENCY: if the patient describes severe facial or mouth swelling, difficulty breathing or swallowing, bleeding that will not stop, or a mouth injury after a blow to the head, your FIRST sentence must tell them to seek urgent medical help now — A&E or 999 — instead of waiting for an appointment. Do not offer a time in its place. You may take their name and number afterwards so the practice can follow up.',\n'- Never diagnose, never name or recommend a medicine or a dose, and never tell a patient a symptom is nothing to worry about.',\n'- You are the practice assistant, not a clinician. If the patient asks for a person, say the practice team will pick this up, take their contact, and stop pressing for a booking.',\n'Clinical questions get no advice: say the dentist confirms at the appointment, and offer to book.',\n'FIGURES/TIMES (hard rule): real fees and diary are NOT available to you. Never state a price or a specific free slot as fact. Give a guide range, attach the real answer to the practice.',\n'BOOKING: collect FOUR things across the chat: name, treatment, preferred day/time, and best contact. Ask for the next MISSING one, one at a time. When you have all four, confirm in one sentence and mark complete.',\n'OUTPUT: reply ONLY with strict minified JSON, exactly these keys:',\n'{\"reply\": string, \"booking\": null | {\"name\": string, \"treatment\": string, \"preferred_time\": string, \"contact\": string}, \"booking_complete\": boolean}'\n].join('\\n');\n\nconst openaiMessages = [{ role: 'system', content: system }].concat(hist);\nreturn [{ json: { openaiMessages, wa_from: inp.wa_from, wa_name: inp.wa_name || '',\n                  phone_number_id: inp.phone_number_id, memKey: key, clinicName: clinic.name } }];\n"
+      },
+      "name": "Build Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        420
+      ],
+      "id": "5460e2d6-353b-4565-8c52-b5593deac318"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", response_format: { type: \"json_object\" }, temperature: 0.4, messages: $json.openaiMessages }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "OpenAI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        420
+      ],
+      "id": "3299dc56-842b-4678-938f-f89532d81059"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Parse the model JSON; append assistant reply to phone-keyed memory.\nconst resp = $json;\nconst raw = (resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) || '{}';\nlet p; try { p = JSON.parse(raw); } catch (e) { p = {}; }\nconst b = p.booking || null;\nconst complete = !!p.booking_complete && b && b.name && b.treatment && b.preferred_time && b.contact;\nconst reply = (typeof p.reply === 'string' && p.reply.trim()) ? p.reply.trim() : 'Sorry, could you say that again?';\n\nconst ctx = $('Build Request').item.json;\nconst sd = $getWorkflowStaticData('global');\nlet hist = Array.isArray(sd[ctx.memKey]) ? sd[ctx.memKey] : [];\nhist.push({ role: 'assistant', content: reply }); hist = hist.slice(-16); sd[ctx.memKey] = hist;\n\nreturn [{ json: {\n  reply, wa_from: ctx.wa_from, phone_number_id: ctx.phone_number_id,\n  booking: b, booking_complete: !!complete, clinicName: ctx.clinicName\n}}];\n"
+      },
+      "name": "Parse Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        420
+      ],
+      "id": "0d362182-5868-4042-a9b5-655bfa53b3bd"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v23.0/{{ $json.phone_number_id }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer FILL_TOKEN"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: \"whatsapp\", recipient_type: \"individual\", to: $json.wa_from, type: \"text\", text: { body: $json.reply } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Send WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        420
+      ],
+      "id": "097b56b1-3a77-4b4b-90d9-824123becf33"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bc",
+              "leftValue": "={{ $json.booking_complete }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF Booking Complete",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        420
+      ],
+      "id": "01f29be7-743b-42ae-9b93-8d4002cba780"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🦷 <b>WHATSAPP BOOKING REQUEST</b> — {{ $json.clinicName }}\n👤 {{ $json.booking.name }}\n🦷 {{ $json.booking.treatment }}\n🕐 {{ $json.booking.preferred_time }}\n📞 {{ $json.booking.contact }}\n💬 WhatsApp: {{ $json.wa_from }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram Notify",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        320
+      ],
+      "id": "527522ce-2b8f-401d-9289-b1e35006edd2"
+    }
+  ],
+  "connections": {
+    "WA Verify (GET)": {
+      "main": [
+        [
+          {
+            "node": "Verify Token OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token OK?": {
+      "main": [
+        [
+          {
+            "node": "Respond Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 403",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WA Incoming (POST)": {
+      "main": [
+        [
+          {
+            "node": "Parse WA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse WA": {
+      "main": [
+        [
+          {
+            "node": "Build Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Request": {
+      "main": [
+        [
+          {
+            "node": "OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Parse Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Reply": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "IF Booking Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Booking Complete": {
+      "main": [
+        [
+          {
+            "node": "Telegram Notify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
