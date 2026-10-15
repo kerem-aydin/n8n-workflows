@@ -1,0 +1,221 @@
+{
+  "name": "Appointment Reminders (24h ahead)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Appointment Reminders (24h ahead)\nRuns every hour, reads each business from Google Sheets and looks 24-25 hours ahead in its Google Calendar, so every appointment is reminded exactly once (a small ledger blocks duplicates). The list goes to the practice; the delivery channel is a single swap at the end.\n**Plug in:** Google Sheets credentials, YOUR_GOOGLE_SHEET_ID, Telegram (or swap the last node for SMS/WhatsApp).\n**Test:** add a row for tomorrow and run manually.",
+        "height": 300,
+        "width": 520
+      },
+      "id": "note-appointment-reminders",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "rm-cron",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Clinics",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "rm-clinics",
+      "name": "Read Clinics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per active clinic, each carrying the slice of its diary that is due a\n// reminder. Runs hourly and looks 24-25 hours ahead, so every appointment falls\n// into exactly one pass and nobody is reminded twice.\nconst LEAD_HOURS = 24;\nconst now = Date.now();\nconst out = [];\n\nfor (const row of $input.all().map(i => i.json)) {\n  const status = String(row.status || 'active').toLowerCase();\n  if (status === 'inactive') continue;\n  const id = String(row.clinic_id || '').trim();\n  if (!id) continue;\n\n  out.push({ json: {\n    clinicId: id,\n    name: row.name || 'the practice',\n    calendarId: String(row.calendar_id || '').trim() || 'primary',\n    timezone: String(row.timezone || '').trim() || 'Europe/London',\n    notify_chat: String(row.notify_chat || 'YOUR_ID'),\n    // which route the practice has chosen for its patients; until a patient\n    // channel is live this stays 'practice' and the list goes to the clinic\n    channel: String(row.reminder_channel || '').trim().toLowerCase() || 'practice',\n    timeMin: new Date(now + LEAD_HOURS * 3600000).toISOString(),\n    timeMax: new Date(now + (LEAD_HOURS + 1) * 3600000).toISOString()\n  }});\n}\n\nreturn out;\n"
+      },
+      "id": "rm-windows",
+      "name": "Clinic Windows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.calendarId) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $json.timeMin }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $json.timeMax }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "rm-list",
+      "name": "Tomorrow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide who is actually due a reminder, and write what it should say.\n//\n// The delivery channel is deliberately not decided here. Whether this ends up as\n// the practice's own email, an SMS or a WhatsApp message, the answer to \"who,\n// when, and what does it say\" is the same — so it is settled once, here.\n\nconst clinics = $('Clinic Windows').all().map(i => i.json);\nconst responses = $input.all().map(i => i.json);\n\nconst sd = $getWorkflowStaticData('global');\nsd._rem = sd._rem || {};\nconst now = Date.now();\n// forget events older than a week so the ledger cannot grow without bound\nfor (const k in sd._rem) if (now - sd._rem[k] > 7 * 86400000) delete sd._rem[k];\n\nconst esc = (x) => String(x || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst NL = String.fromCharCode(10);\nconst out = [];\n\nfor (let i = 0; i < responses.length; i++) {\n  const clinic = clinics[i] || clinics[0];\n  if (!clinic) continue;\n  const events = (responses[i] && responses[i].items) || [];\n  const due = [];\n\n  for (const e of events) {\n    if (!e || e.status === 'cancelled') continue;\n    const start = (e.start || {}).dateTime;\n    if (!start) continue;                       // all-day blocks are not appointments\n\n    // Keyed on the calendar, not the clinic: two clinic records pointing at one\n    // diary must not each send their own copy of the same appointment.\n    const key = clinic.calendarId + ':' + e.id;\n    if (sd._rem[key]) continue;                 // already reminded on an earlier pass\n\n    // The patient's contact is either on the event as a guest, or in the line the\n    // assistant wrote into the description when it booked.\n    const desc = String(e.description || '');\n    const fromDesc = (desc.match(/^Contact:\\s*(.+)$/m) || [])[1] || '';\n    const guest = ((e.attendees || []).filter(a => a && a.email && !a.organizer)[0] || {}).email || '';\n    const contact = String(fromDesc || guest).trim();\n    const patient = (desc.match(/^Patient:\\s*(.+)$/m) || [])[1] || '';\n\n    sd._rem[key] = now;\n    due.push({\n      when: new Intl.DateTimeFormat('en-GB', { timeZone: clinic.timezone, weekday: 'long',\n              day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit', hour12: true }).format(new Date(start)),\n      summary: e.summary || 'Appointment',\n      patient: patient.trim(),\n      contact,\n      reachable: /@/.test(contact) ? 'email' : (/\\d{6,}/.test(contact) ? 'phone' : 'none')\n    });\n  }\n\n  if (!due.length) continue;\n\n  const lines = ['⏰ <b>APPOINTMENT REMINDERS DUE</b>', esc(clinic.name), ''];\n  for (const d of due) {\n    lines.push('<b>' + esc(d.when) + '</b>');\n    lines.push(esc(d.summary) + (d.patient ? '  ·  ' + esc(d.patient) : ''));\n    lines.push(d.contact ? esc(d.contact) : 'no contact on file');\n    lines.push('');\n  }\n  lines.push('Tomorrow, 24 hours ahead. ' + due.length + ' to confirm.');\n\n  out.push({ json: {\n    clinicId: clinic.clinicId,\n    notify_chat: clinic.notify_chat,\n    channel: clinic.channel,\n    count: due.length,\n    reminders: due,\n    text: lines.join(NL)\n  }});\n}\n\nreturn out;\n"
+      },
+      "id": "rm-due",
+      "name": "Due Reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "rm-tg",
+      "name": "Send To Practice",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Read Clinics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Clinics": {
+      "main": [
+        [
+          {
+            "node": "Clinic Windows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clinic Windows": {
+      "main": [
+        [
+          {
+            "node": "Tomorrow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tomorrow": {
+      "main": [
+        [
+          {
+            "node": "Due Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Due Reminders": {
+      "main": [
+        [
+          {
+            "node": "Send To Practice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
