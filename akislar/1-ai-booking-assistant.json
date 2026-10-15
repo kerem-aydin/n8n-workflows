@@ -1,0 +1,552 @@
+{
+  "name": "AI Booking Assistant (live calendar availability)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## AI Booking Assistant (live calendar availability)\nChat endpoint for a clinic/salon website or messaging channel. Reads the business row from Google Sheets, asks Google Calendar free/busy for real open slots, lets the model offer only those times, then writes the booking to Sheets + Calendar and pings Telegram (extra alert for high-value treatments).\n**Plug in:** OpenAI, Google Sheets + Calendar credentials, YOUR_GOOGLE_SHEET_ID, YOUR_TELEGRAM_CHAT_ID.\n**Test:** POST {\"message\":\"Can I book a cleaning tomorrow at 10?\"} to the webhook.\nRan in production for our own demo clinic.",
+        "height": 300,
+        "width": 520
+      },
+      "id": "note-booking-brain",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "booking-brain",
+        "responseMode": "responseNode",
+        "responseData": "firstEntryJson",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "id": "bea32389-c7f1-421a-8c16-475f325500f9"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The clinic and the real diary are already resolved upstream. This node only\n// builds the prompt for THAT clinic, with THAT diary.\nconst body = ($('Webhook').first().json.body) || {};\nlet messages = Array.isArray(body.messages) ? body.messages : [];\nif (!messages.length && typeof body.message === 'string') messages = [{ role:'user', content: body.message }];\n\nconst av = $json || {};\nconst clinic = $('Resolve Clinic').first().json.clinic;\nconst hasDiary = !!av.availability_known && Array.isArray(av.slots) && av.slots.length > 0;\n\n// The model cannot resolve \"tomorrow\" without knowing today. Give it the practice's\n// own local date, not the server's.\nconst todayLocal = new Intl.DateTimeFormat('en-GB', {\n  timeZone: clinic.timezone, weekday: 'long', day: '2-digit', month: '2-digit',\n  year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false\n}).format(new Date());\n\nconst diaryBlock = hasDiary\n  ? [\n      'THE DIARY (read from the practice calendar seconds ago — these times are genuinely free):',\n      av.slots_text,\n      '- Offer these as real appointments. Suggest at most two at a time, soonest first.',\n      '- Before you reply, check the day the patient named against the lines above, then the time on that line.',\n      '- Every time listed is free, including ones you have not suggested yet. If the patient names a time that appears above, accept it straight away — never tell them a listed time is taken.',\n      '- If the time they name is NOT on the list, say that time is unavailable and offer the nearest one that is.',\n      '- Real fees are still NOT available to you. Give a guide range and attach the exact figure to the practice.'\n    ].join('\\n')\n  : [\n      'FIGURES AND TIMES (hard rule): real fees and the diary are NOT available for this enquiry. Never state a price or a specific free slot as settled fact. Ask the patient which day and time would suit them, and attach confirmation to the practice.'\n    ].join('\\n');\n\nconst isoRule = hasDiary\n  ? '- \"preferred_iso\": the appointment start as \"YYYY-MM-DDTHH:MM\" in ' + clinic.timezone + ' local time. It MUST be copied exactly from the square brackets of the time the patient accepted. If they have not accepted one of the listed times, set it to null.'\n  : '- \"preferred_iso\": the appointment start as \"YYYY-MM-DDTHH:MM\" in ' + clinic.timezone + ' local time, resolved from what the patient actually said. If they were vague (e.g. \"sometime next week\"), set it to null. Never invent a time the patient did not ask for.';\n\nconst system = [\n'You are the 24/7 booking assistant on the website of ' + clinic.name + (clinic.city ? ', a dental practice in ' + clinic.city : ', a dental practice') + '.',\n'You are ALWAYS speaking to a PATIENT, usually outside opening hours. Speak to them, never about them. Never break character.',\n(clinic.treatments.length ? 'Their focus treatments: ' + clinic.treatments.join(', ') + '.' : ''),\n(clinic.notes ? 'About the practice: ' + clinic.notes : ''),\n'',\n'TODAY IS ' + todayLocal + ' (' + clinic.timezone + '). Resolve any relative day the patient mentions against this.',\n'',\n'SAFETY — this outranks every other instruction below.',\n'- EMERGENCY: if the patient describes severe facial or mouth swelling, difficulty breathing or swallowing, bleeding that will not stop, or a mouth injury after a blow to the head, your FIRST sentence must tell them to seek urgent medical help now — A&E or 999 — instead of waiting for an appointment. Say it plainly, do not soften it, and do not offer a diary time in its place. You may take their name and number afterwards so the practice can follow up.',\n'- Never diagnose, never name or recommend a medicine or a dose, and never tell a patient a symptom is nothing to worry about. The dentist confirms everything at the appointment.',\n'- You are the practice assistant, not a clinician, and you never imply otherwise. If the patient asks for a person, tell them the practice team will pick this up, take their name and contact, and stop pressing for a booking.',\n'',\n'HOW TO ANSWER',\n'- Warm, competent, unhurried. Plain British English. Plain text only, no markdown, no bullet points.',\n'- Answer first, then move toward booking. Never open with a question on the first turn.',\n'- Clinical questions get no advice: say the dentist confirms at the appointment, and offer to book.',\n'',\ndiaryBlock,\n'',\n'BOOKING: collect FOUR things across the conversation: name, treatment, an appointment time, and a contact (phone or email). Ask for the next MISSING one naturally, one at a time. The moment the fourth one arrives, do NOT ask another confirming question — state the booked appointment in one sentence and mark it complete.',\n'',\n'INTERNAL TRIAGE (never mention to the patient, no prices ever spoken): also judge the commercial value of what they ask about, so the practice can prioritise:',\n'- \"high\": implants, full Invisalign/orthodontics, multiple veneers, full-mouth or smile-makeover work (roughly GBP 1500+).',\n'- \"medium\": single crown or veneer, whitening, a hygiene plan, a single filling (roughly GBP 150-1500).',\n'- \"low\": routine check-up, single hygiene visit, or a general enquiry (under about GBP 150).',\n'',\n'CLINICAL PRIORITY (also internal, never mentioned to the patient): set \"urgent\" true when the patient describes pain, swelling, bleeding, a broken or knocked-out tooth, a lost filling or crown that hurts, or anything else that cannot reasonably wait for a routine appointment. Judge this INDEPENDENTLY of the money: a cheap enquiry is often the urgent one, and an expensive one is usually not.',\n'',\n'OUTPUT: reply ONLY with strict minified JSON, nothing else, with EXACTLY these keys:',\n'{\"reply\": string, \"booking\": null | {\"name\": string, \"treatment\": string, \"preferred_time\": string, \"contact\": string, \"preferred_iso\": string|null, \"duration_minutes\": number}, \"booking_complete\": boolean, \"triage\": {\"tier\": \"high\"|\"medium\"|\"low\", \"est_value_gbp\": number, \"treatment\": string, \"urgent\": boolean}}',\nisoRule,\n'- \"duration_minutes\": 60 for implant, Invisalign or smile-makeover consultations, otherwise 30.',\n'- \"reply\" is the text the patient sees (max 3 sentences). Never quote a price or the triage in it. Never show the square-bracket codes to the patient.',\n'- Set booking_complete true and fill booking ONLY when all four details are gathered; otherwise booking null and booking_complete false.',\n'- Always include triage (best guess if not stated: tier \"low\", urgent false).'\n].filter(Boolean).join('\\n');\n\nconst hist = messages\n  .filter(m => m && (m.role==='user'||m.role==='assistant') && typeof m.content==='string')\n  .slice(-12).map(m => ({ role:m.role, content:m.content.slice(0,1000) }));\nconst openaiMessages = [{ role:'system', content: system }].concat(hist);\n\nreturn [{ json: {\n  openaiMessages,\n  clinic,\n  allowed_iso: hasDiary ? av.allowed_iso : [],\n  diary_read: hasDiary\n}}];"
+      },
+      "name": "Build Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ],
+      "id": "8221c3d7-570b-4ba4-a0c6-4aca20b20528"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-5.4-nano\", reasoning_effort: \"low\", response_format: { type: \"json_object\" }, messages: $json.openaiMessages }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "OpenAI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        920,
+        300
+      ],
+      "id": "6d33785a-cb17-4819-8565-7541898ad106"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Parse the model JSON; never throw. Extract booking + internal triage; build a notify flag.\nconst resp = $json;\nconst raw = (resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) || '{}';\nlet p; try { p = JSON.parse(raw); } catch (e) { p = {}; }\nconst clinic = $('Build Request').item.json.clinic;\nconst b = p.booking || null;\nconst complete = !!p.booking_complete && b && b.name && b.treatment && b.preferred_time && b.contact;\n\n// Validate the model's datetime before it is ever allowed near a real diary.\nlet iso = (b && typeof b.preferred_iso === 'string') ? b.preferred_iso.trim() : '';\nlet isoOk = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}$/.test(iso);\nif (isoOk) {\n  const when = new Date(iso + ':00');\n  if (isNaN(when.getTime())) isoOk = false;\n  else if (when.getTime() < Date.now() - 86400000) isoOk = false; // never book the past\n}\n// A time we did not verify as free never reaches the diary. The practice is still\n// notified, so nothing is lost — it just is not written as a confirmed appointment.\nconst allowedIso = $('Build Request').first().json.allowed_iso || [];\nif (isoOk && allowedIso.length && allowedIso.indexOf(iso) === -1) isoOk = false;\n\nlet dur = b ? Number(b.duration_minutes) : 30;\nif (!isFinite(dur) || dur < 15 || dur > 240) dur = 30;\n\nconst t = p.triage || {};\nlet tier = (t.tier === 'high' || t.tier === 'medium' || t.tier === 'low') ? t.tier : 'low';\nlet val = Number(t.est_value_gbp);\nif (!isFinite(val) || val < 0) val = 0;\n// Urgency rides its own axis. Reading it off the money tier is precisely how a\n// broken tooth at 01:04 gets filed as routine and nobody is told.\nconst urgent = t.urgent === true;\nconst flag = urgent\n  ? (tier === 'high' ? '🚑 URGENT · 🔥 HIGH VALUE' : '🚑 URGENT')\n  : (tier === 'high' ? '🔥 HIGH VALUE' : (tier === 'medium' ? '• Medium value' : '◦ Routine'));\n\nreturn [{ json: {\n  reply: (typeof p.reply === 'string' && p.reply.trim()) ? p.reply : 'Sorry, could you say that again?',\n  booking: b,\n  booking_complete: !!complete,\n  triage_tier: tier,\n  triage_value: Math.round(val),\n  triage_flag: flag,\n  triage_urgent: urgent,\n  triage_treatment: (t && typeof t.treatment === 'string') ? t.treatment : '',\n  booking_iso: isoOk ? iso : null,\n  booking_duration: dur,\n  clinic\n}}];\n"
+      },
+      "name": "Parse Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        300
+      ],
+      "id": "9d7e82cf-8b89-4a89-a8f7-8acb58a2f532"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "booking-complete",
+              "leftValue": "={{ $json.booking_complete }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF Booking Complete",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ],
+      "id": "696dd7e8-8a11-4656-b176-3657bf018000"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=📅 <b>NEW APPOINTMENT BOOKED</b>\n{{ $json.clinic.name }}\n\n👤 {{ $json.booking.name }}\n🦷 {{ $json.booking.treatment }}\n🕒 {{ $json.booking.preferred_time }}\n📞 {{ $json.booking.contact }}\n{{ $json.triage_flag }}{{ $json.triage_value ? '  ·  approx £' + $json.triage_value : '' }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram Notify",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1580,
+        200
+      ],
+      "id": "7f623fa6-f39b-4711-9764-a88f7369807a"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Single last node for BOTH branches -> its output is the webhook response.\nconst p = $('Parse Reply').item.json;\nreturn [{ json: { reply: p.reply, booked: !!p.booking_complete } }];\n"
+      },
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        300
+      ],
+      "id": "73956434-8233-44c6-b463-82beaa1f2fbd"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst p = $('Parse Reply').item.json; const b = p.booking || {};\nreturn [{ json: {\n  \"Timestamp\": new Date().toISOString(),\n  \"Name\": b.name || '', \"Treatment\": b.treatment || '',\n  \"Preferred Time\": b.preferred_time || '', \"Contact\": b.contact || '',\n  \"Tier\": p.triage_tier || '', \"Est Value (GBP)\": p.triage_value || 0,\n  \"Clinic\": (p.clinic && p.clinic.name) || ''\n}}];\n"
+      },
+      "name": "Shape Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        120
+      ],
+      "id": "dd7ff72d-9ad4-4632-bcf7-df1fe6785f48"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Bookings",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "name": "Sheets Append",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2020,
+        120
+      ],
+      "id": "35f64b36-5d75-4240-90b3-37ae2a40e1f1"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Clinics",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "name": "Read Clinics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        110,
+        300
+      ],
+      "id": "dd3e54b2-1721-4791-92f1-1d33cae6c993"
+    },
+    {
+      "parameters": {
+        "jsCode": "/* ── Write ceiling ─────────────────────────────────────────────────────────\n   The abuse guard upstream limits how many requests reach the model, but that\n   guard is not reliable under a parallel flood: n8n loads static data at the\n   start of an execution and saves it at the end, so concurrent executions never\n   see each other's counters. Proven, not assumed — with the global cap lowered\n   to five, fourteen parallel requests all passed.\n\n   So the diary gets its own ceiling here, at the last node before anything is\n   written. This is the asset worth protecting: a practice can absorb a wasted\n   OpenAI call, but not a morning of invented appointments.\n\n   Sequential floods are stopped outright. A parallel flood still slips some\n   through, for the same reason as above — but it now has to get past a limit\n   that is counted per clinic per hour rather than per request, so the damage is\n   bounded instead of unbounded. Replace with a shared counter when one exists.\n\n   Fails OPEN: a broken ceiling must never stop a real patient being booked. */\nconst WRITE_CAP = { perClinicPerHour: 12, windowMs: 3600000 };\ntry {\n  const cid = String(($('Resolve Clinic').first().json.clinic || {}).id || 'unknown');\n  const sd = $getWorkflowStaticData('global');\n  const now = Date.now();\n  sd._wr = sd._wr || {};\n  sd._wr[cid] = (sd._wr[cid] || []).filter((t) => now - t < WRITE_CAP.windowMs);\n  if (sd._wr[cid].length >= WRITE_CAP.perClinicPerHour) {\n    /* Nothing is written and the patient still gets their reply — the calendar\n       branch is isolated from the conversation for exactly this reason. */\n    return [];\n  }\n  sd._wr[cid].push(now);\n  for (const k in sd._wr) {\n    sd._wr[k] = sd._wr[k].filter((t) => now - t < WRITE_CAP.windowMs);\n    if (!sd._wr[k].length) delete sd._wr[k];\n  }\n} catch (e) { /* fail open */ }\n\n// Build the calendar event. Returning nothing is a valid outcome: if the patient\n// never gave a resolvable time, nothing should be written to the diary.\nconst p = $('Parse Reply').item.json;\nconst b = p.booking || {};\nconst c = p.clinic || {};\nconst tz = c.timezone || 'Europe/London';\nconst iso = p.booking_iso;\nif (!iso) return [];\n\nconst dur = p.booking_duration || 30;\nconst startD = new Date(iso + ':00');\nconst endD = new Date(startD.getTime() + dur * 60000);\nconst pad = (n) => String(n).padStart(2, '0');\nconst fmt = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +\n                   'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':00';\n\nconst value = p.triage_value ? ' (~GBP ' + p.triage_value + ')' : '';\n\nconst body = {\n  summary: (b.treatment || 'Appointment') + ' - ' + (b.name || 'Patient'),\n  description: [\n    'Booked by the YourBrand assistant.',\n    'Patient: ' + (b.name || ''),\n    'Treatment: ' + (b.treatment || ''),\n    'Contact: ' + (b.contact || ''),\n    'Patient asked for: ' + (b.preferred_time || ''),\n    'Value tier: ' + (p.triage_tier || '') + value\n  ].join('\\n'),\n  start: { dateTime: fmt(startD), timeZone: tz },\n  end: { dateTime: fmt(endD), timeZone: tz }\n};\n\n// If the patient left an email, invite them properly. Google then sends the\n// confirmation from the practice's own calendar and the appointment lands in the\n// patient's own diary, which is where their reminder comes from. Costs nothing and\n// needs no permission we do not already hold.\nconst contact = String(b.contact || '').trim();\nconst email = (contact.match(/[^\\s<>,;]+@[^\\s<>,;]+\\.[A-Za-z]{2,}/) || [])[0];\nlet sendUpdates = 'none';\n// Reserved test domains (RFC 2606) can never receive mail. Writing the event is\n// fine; sending an invitation to one only produces a bounce.\nconst realEmail = email && !/@(example\\.(com|org|net)|test|invalid|localhost)$/i.test(email);\nif (realEmail) {\n  body.attendees = [{ email: email, displayName: b.name || undefined, responseStatus: 'needsAction' }];\n  body.guestsCanModify = false;\n  body.guestsCanInviteOthers = false;\n  body.guestsCanSeeOtherGuests = false;\n  sendUpdates = 'all';\n}\n\nreturn [{ json: { calendarId: c.calendar_id || 'primary', sendUpdates, body } }];\n"
+      },
+      "id": "e5555555-5555-4555-8555-555555555555",
+      "name": "Shape Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.calendarId) }}/events?sendUpdates={{ $json.sendUpdates }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "f6666666-6666-4666-8666-666666666666",
+      "name": "Calendar Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1800,
+        420
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "a7777777-7777-4777-8777-777777777777",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/* ── Abuse guard ───────────────────────────────────────────────────────────\n   The webhook is public and unauthenticated by necessity: it is called from a\n   patient's browser on the practice's own site, so any secret shipped to that\n   browser is readable by anyone who views source. The defence therefore cannot\n   be a password — it has to be limits on what the endpoint will DO.\n\n   The previous guard counted requests per IP, keyed on x-forwarded-for. That\n   header is supplied by the caller, so a single attacker sending a new value on\n   every request got a fresh empty bucket each time and was never limited. The\n   per-IP bucket is kept (it still stops honest runaway clients) but it is now\n   backed by two limits that cannot be spoofed away: a global ceiling and a\n   per-clinic ceiling.\n\n   Every limit fails OPEN on error. A guard that breaks the booking flow costs\n   more than the abuse it prevents. */\nconst GUARD = { perIp: 20, global: 90, perClinic: 40, windowMs: 60000 };\n\ntry {\n  const h = ($('Webhook').first().json.headers) || {};\n  const b0 = ($('Webhook').first().json.body) || {};\n  const now = Date.now();\n  const sd = $getWorkflowStaticData('global');\n  const fresh = (arr) => (arr || []).filter((t) => now - t < GUARD.windowMs);\n\n  const ip = String(h['x-forwarded-for'] || h['x-real-ip'] || 'unknown').split(',')[0].trim();\n  const cid = String(b0.clinicId || b0.clinic_id || 'unknown').toLowerCase().trim();\n\n  /* Global ceiling — the only limit an attacker cannot reset by changing a\n     header. This is what actually caps the OpenAI bill. */\n  sd._all = fresh(sd._all);\n  if (sd._all.length >= GUARD.global) return [];\n  sd._all.push(now);\n\n  /* Per-clinic ceiling — keeps one practice's diary from being flooded even if\n     the global ceiling has room. This is the diary's real protection. */\n  sd._cl = sd._cl || {};\n  sd._cl[cid] = fresh(sd._cl[cid]);\n  if (sd._cl[cid].length >= GUARD.perClinic) return [];\n  sd._cl[cid].push(now);\n\n  /* Per-IP, as before. Spoofable, but it costs an attacker nothing to keep and\n     it catches the ordinary case of a stuck client retrying in a loop. */\n  sd._rl = sd._rl || {};\n  sd._rl[ip] = fresh(sd._rl[ip]);\n  if (sd._rl[ip].length >= GUARD.perIp) return [];\n  sd._rl[ip].push(now);\n\n  /* Static data is persisted with the workflow, so it must not grow forever. */\n  if (Math.random() < 0.05) {\n    for (const k in sd._rl) { sd._rl[k] = fresh(sd._rl[k]); if (!sd._rl[k].length) delete sd._rl[k]; }\n    for (const k in sd._cl) { sd._cl[k] = fresh(sd._cl[k]); if (!sd._cl[k].length) delete sd._cl[k]; }\n  }\n} catch (e) { /* fail open — never block a real patient because the guard broke */ }\n\n// Resolve the clinic from the Clinics config (never from the client body) and work out\n// the window we want the diary for. Everything downstream reads the clinic from here.\nconst body = ($('Webhook').first().json.body) || {};\nconst clinicId = String(body.clinicId || body.clinic_id || '').toLowerCase().trim();\n\nconst clinics = $input.all().map(i => i.json);\nlet c = clinics.find(r => String(r.clinic_id||'').toLowerCase().trim() === clinicId && String(r.status||'active').toLowerCase() !== 'inactive');\nif (!c) c = clinics.find(r => String(r.clinic_id||'').toLowerCase().trim() === 'birchgrove') || clinics[0] || {};\n\nconst clinic = {\n  id: String(c.clinic_id || 'birchgrove'),\n  name: c.name || 'the practice',\n  city: c.city || '',\n  treatments: String(c.treatments||'').split(/[,|]/).map(s=>s.trim()).filter(Boolean),\n  notes: c.notes || '',\n  notify_chat: String(c.notify_chat || 'YOUR_ID'),\n  calendar_id: String(c.calendar_id || '').trim() || 'primary',\n  timezone: String(c.timezone || '').trim() || 'Europe/London',\n  // opening hours drive which slots may be offered; safe defaults until the\n  // config sheet carries its own columns\n  open_time: String(c.open_time || '').trim() || '09:00',\n  close_time: String(c.close_time || '').trim() || '17:00',\n  open_days: String(c.open_days || '').trim().toLowerCase() || 'mon,tue,wed,thu,fri',\n  slot_minutes: Number(c.slot_minutes) > 0 ? Number(c.slot_minutes) : 30\n};\n\n// look one week ahead, starting an hour from now\nconst now = Date.now();\nconst freeBusy = {\n  timeMin: new Date(now).toISOString(),\n  timeMax: new Date(now + 8*86400000).toISOString(),\n  timeZone: clinic.timezone,\n  items: [{ id: clinic.calendar_id }]\n};\n\nreturn [{ json: { clinic, freeBusy } }];"
+      },
+      "id": "veluxo-resolve-clinic",
+      "name": "Resolve Clinic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.freeBusy) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 12000
+        }
+      },
+      "id": "veluxo-free-busy",
+      "name": "Free Busy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        380,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the practice's busy blocks into offerable start times, in the practice's own\n// timezone and opening hours. Only starts with a full clear hour are offered, so any\n// treatment length fits whatever the assistant books.\nconst clinic = $('Resolve Clinic').first().json.clinic;\nconst tz = clinic.timezone;\nconst resp = $json || {};\n\nlet busy = [];\nlet known = false;\ntry {\n  const cals = resp.calendars || {};\n  for (const k in cals) {\n    const cal = cals[k] || {};\n    if (cal.errors && cal.errors.length) continue;   // this calendar could not be read\n    known = true;\n    for (const b of (cal.busy || [])) {\n      const s = Date.parse(b.start), e = Date.parse(b.end);\n      if (isFinite(s) && isFinite(e) && e > s) busy.push([s, e]);\n    }\n  }\n} catch (e) { known = false; busy = []; }\n\n// --- timezone helpers: wall-clock time in tz <-> epoch, DST-safe -------------\nfunction partsIn(d) {\n  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false,\n    year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit',\n    minute:'2-digit', second:'2-digit', weekday:'short' });\n  const o = {}; for (const p of f.formatToParts(d)) o[p.type] = p.value; return o;\n}\nfunction offsetAt(d) {\n  const p = partsIn(d);\n  const h = p.hour === '24' ? 0 : Number(p.hour);\n  return Date.UTC(Number(p.year), Number(p.month)-1, Number(p.day), h, Number(p.minute), Number(p.second)) - d.getTime();\n}\nfunction localToEpoch(y, m, d, hh, mm) {\n  const guess = Date.UTC(y, m-1, d, hh, mm);\n  let off = offsetAt(new Date(guess));\n  const once = guess - off;\n  off = offsetAt(new Date(once));          // second pass settles DST boundaries\n  return guess - off;\n}\nfunction two(n){ return String(n).padStart(2,'0'); }\n\nconst hhmm = (s, fb) => {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(s||'').trim());\n  return m ? [Number(m[1]), Number(m[2])] : fb;\n};\nconst [openH, openM]   = hhmm(clinic.open_time,  [9, 0]);\nconst [closeH, closeM] = hhmm(clinic.close_time, [17, 0]);\nconst openDays = clinic.open_days.split(',').map(s => s.trim().slice(0,3)).filter(Boolean);\n\nconst APPT = 60 * 60000;                 // always keep a clear hour\nconst STEP = clinic.slot_minutes * 60000;\nconst LEAD = 60 * 60000;                 // never offer something starting within the hour\nconst earliest = Date.now() + LEAD;\n\nconst free = (a, b) => !busy.some(([s, e]) => a < e && b > s);\n\nconst days = [];\nconst slots = [];\nfor (let i = 0; i < 8 && slots.length < 8; i++) {\n  const probe = new Date(Date.now() + i * 86400000);\n  const p = partsIn(probe);\n  const wd = String(p.weekday || '').toLowerCase().slice(0,3);\n  if (openDays.indexOf(wd) === -1) continue;\n\n  const y = Number(p.year), mo = Number(p.month), da = Number(p.day);\n  const dayOpen  = localToEpoch(y, mo, da, openH, openM);\n  const dayClose = localToEpoch(y, mo, da, closeH, closeM);\n\n  const open = [];\n  for (let t = dayOpen; t + APPT <= dayClose; t += STEP) {\n    if (t < earliest) continue;\n    if (!free(t, t + APPT)) continue;\n    open.push(t);\n  }\n  // Offer across the day rather than three times in a row at opening: the patient\n  // gets a morning, a midday and an afternoon choice when the diary allows it.\n  const mid = dayOpen + (dayClose - dayOpen) / 2;\n  const late = dayOpen + (dayClose - dayOpen) * 0.75;\n  const picks = [];\n  const take = (t) => { if (t !== undefined && picks.indexOf(t) === -1) picks.push(t); };\n  take(open[0]);\n  take(open.find(t => t >= mid));\n  take(open.filter(t => t >= late).pop());\n  if (picks.length < 3) for (const t of open) { if (picks.length >= 3) break; take(t); }\n  picks.sort((a, b) => a - b);\n\n  const found = picks.map(t => {\n    const lp = partsIn(new Date(t));\n    return {\n      iso: lp.year + '-' + lp.month + '-' + lp.day + 'T' + lp.hour + ':' + lp.minute,\n      label: new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday:'long', day:'numeric', month:'long' }).format(new Date(t))\n             + ' at ' + new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour:'numeric', minute:'2-digit', hour12:true }).format(new Date(t)).replace(' ', '')\n    };\n  });\n  if (found.length) { days.push(found); slots.push.apply(slots, found); }\n}\n\nconst offered = slots.slice(0, 6);\n\n// One line per day. A single run-on line of six times is read unreliably by a small\n// model — grouped by day it stops mistaking a listed time for a taken one.\nconst order = [];\nconst grouped = {};\nfor (const s of offered) {\n  const day = s.label.split(' at ')[0];\n  const time = s.label.split(' at ')[1];\n  if (!grouped[day]) { grouped[day] = []; order.push(day); }\n  grouped[day].push(time + ' [' + s.iso + ']');\n}\nconst NL = String.fromCharCode(10);\nconst slotsText = order.map(d => d + ': ' + grouped[d].join(', ')).join(NL);\n\nreturn [{ json: {\n  clinic,\n  availability_known: known && offered.length > 0,\n  slots: offered,\n  slots_text: slotsText,\n  allowed_iso: offered.map(s => s.iso)\n}}];"
+      },
+      "id": "veluxo-open-slots",
+      "name": "Open Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fire only for a genuinely valuable enquiry that has NOT completed — a completed\n// booking already sends its own notification.\nconst p = $json;\n// Money and urgency are separate grounds for waking the practice. And unlike a\n// high-value enquiry, an urgent one still deserves the alert AFTER the booking is\n// written -- the slot being filled does not make the pain wait any better.\nconst isUrgent = p.triage_urgent === true;\nif (p.triage_tier !== 'high' && !isUrgent) return [];\nif (p.booking_complete && !isUrgent) return [];\n\nconst h = ($('Webhook').first().json.headers) || {};\nconst body = ($('Webhook').first().json.body) || {};\nconst ip = String(h['x-forwarded-for'] || h['x-real-ip'] || 'unknown').split(',')[0].trim();\nconst msgs = Array.isArray(body.messages) ? body.messages : [];\nconst firstUser = String(((msgs.filter(m => m && m.role === 'user')[0]) || {}).content || body.message || '');\n\n// One alert per patient conversation. Without this the practice gets a buzz on every\n// message of the same conversation and starts ignoring the alerts.\nlet sig = 0;\nconst s = String(p.clinic.id) + '|' + ip + '|' + firstUser.slice(0, 200);\nfor (let i = 0; i < s.length; i++) sig = ((sig << 5) - sig + s.charCodeAt(i)) | 0;\nconst key = 'hv_' + sig;\n\nconst sd = $getWorkflowStaticData('global');\nsd._hv = sd._hv || {};\nconst now = Date.now();\nconst WINDOW = 6 * 3600000;\nfor (const k in sd._hv) if (now - sd._hv[k] > WINDOW) delete sd._hv[k];\nif (sd._hv[key]) return [];\nsd._hv[key] = now;\n\nconst esc = (x) => String(x || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst bk = p.booking || {};\nconst NL = String.fromCharCode(10);\n\n// The message is assembled here rather than in the Telegram template, so a detail the\n// patient has not given yet leaves no blank line behind.\nconst who = [bk.name ? '👤 ' + esc(bk.name) : '', bk.contact ? esc(bk.contact) : '']\n  .filter(Boolean).join('  ·  ');\n\nconst out = [];\nout.push(isUrgent ? '🚑 <b>URGENT PATIENT — LIVE NOW</b>' : '💷 <b>HIGH-VALUE ENQUIRY — LIVE NOW</b>');\nout.push(esc(p.clinic.name));\nout.push('');\nout.push(esc(bk.treatment || p.triage_treatment || (isUrgent ? 'Urgent enquiry' : 'High-value enquiry'))\n         + (p.triage_value ? '  ·  approx £' + p.triage_value : ''));\nout.push('“' + esc(firstUser.replace(/\\s+/g, ' ').slice(0, 180)) + '”');\nif (who) out.push(who);\nout.push('');\nout.push(p.booking_complete\n  ? 'The assistant has already written this appointment into the diary.'\n  : 'The assistant is still speaking with this patient.');\n\nreturn [{ json: { clinic: p.clinic, text: out.join(NL) } }];\n"
+      },
+      "id": "veluxo-high-value-gate",
+      "name": "High Value Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "veluxo-alert-high-value",
+      "name": "Alert High Value",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1560,
+        640
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Read Clinics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Request": {
+      "main": [
+        [
+          {
+            "node": "OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Parse Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Reply": {
+      "main": [
+        [
+          {
+            "node": "IF Booking Complete",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Value Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Booking Complete": {
+      "main": [
+        [
+          {
+            "node": "Telegram Notify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Notify": {
+      "main": [
+        [
+          {
+            "node": "Shape Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Shape Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Row": {
+      "main": [
+        [
+          {
+            "node": "Sheets Append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets Append": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Clinics": {
+      "main": [
+        [
+          {
+            "node": "Resolve Clinic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Event": {
+      "main": [
+        [
+          {
+            "node": "Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Clinic": {
+      "main": [
+        [
+          {
+            "node": "Free Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Free Busy": {
+      "main": [
+        [
+          {
+            "node": "Open Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Slots": {
+      "main": [
+        [
+          {
+            "node": "Build Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Value Gate": {
+      "main": [
+        [
+          {
+            "node": "Alert High Value",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
