@@ -1,0 +1,501 @@
+{
+  "name": "Lead Discovery (Google Places to Sheets, deduplicated)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Lead Discovery (Google Places → AI qualification → Sheets)\nEvery morning picks the next city + search term (rotation), pulls businesses with websites from Google Maps via Apify, drops junk and duplicates (also across runs), reads each website, lets the model score the lead 0-100 and say honestly whether the gap was actually verified on the site, appends to Google Sheets and posts a daily Telegram report.\n**Plug in:** Apify token (YOUR_APIFY_TOKEN), OpenAI, Google Sheets service account, YOUR_GOOGLE_SHEET_ID, YOUR_TELEGRAM_CHAT_ID.\n**Test:** run manually; change the city list and search terms for your niche.",
+        "height": 300,
+        "width": 520
+      },
+      "id": "note-lead-discovery",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4848,
+        552
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "d06ac9b5-6fd9-4268-a8de-ad92dd6700a8",
+      "name": "Every Morning 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        4848,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apify.com/v2/acts/compass~crawler-google-places/run-sync-get-dataset-items?token=YOUR_TOKEN",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ searchStringsArray: [$json.term], locationQuery: $json.city, maxCrawledPlacesPerSearch: 15, language: \"en\", countryCode: \"gb\", website: \"withWebsite\", scrapeContacts: true }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "72bc996e-79ae-4b19-9ead-74282ec2bdee",
+      "name": "Apify (Find Clinics)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5296,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function cleanEmail(e){\n  e = String(e || '').toLowerCase().trim();\n  // basic format check\n  if(!/^[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}$/.test(e)) return '';\n  // obvious junk / false-positive domains\n  if(/@(2x|3x|sentry|wixpress|example|godaddy|domain|email)\\./.test(e)) return '';\n  // false matches ending in an image/asset extension\n  if(/\\.(png|jpg|jpeg|gif|webp|svg|css|js)$/.test(e)) return '';\n  return e;\n}\nlet places = [];\nfor (const item of $input.all()) {\n  if (Array.isArray(item.json)) places.push(...item.json);\n  else if (Array.isArray(item.json.data)) places.push(...item.json.data);\n  else places.push(item.json);\n}\nconst out = [];\nconst seen = new Set();\nfor (const p of places) {\n  // LIST CLEANUP: drop non-dental places (e.g. Park Veterinary Group)\n  const kimlik = ((p.categoryName || '') + ' ' + (p.title || '')).toLowerCase();\n  if (!/dent|orthodont|implantolog/.test(kimlik)) continue;\n  if (/veterinar|animal|\\bpet\\b/.test(kimlik)) continue;\n  // ---- TARGET SEGMENT: mid-size private UK dental clinic ----\n  // Budget is 15 leads a day; the rules below drop candidates that would score <=45\n  // before they ever reach the (paid) scoring step.\n  if (!String(p.website || '').trim()) continue;              // no website -> nothing to score\n  if (/\\bnhs\\b/.test(kimlik)) continue;                       // NHS-only -> cannot set its own prices\n  if (Number(p.reviewsCount || 0) < 8) continue;              // dead or single-room listing\n  let raw = '';\n  if (Array.isArray(p.emails) && p.emails.length) raw = p.emails[0];\n  else if (p.contactDetails && Array.isArray(p.contactDetails.emails) && p.contactDetails.emails.length) raw = p.contactDetails.emails[0];\n  const email = cleanEmail(raw);\n  if (!email) continue;            // invalid/junk email -> drop\n  if (seen.has(email)) continue;   // duplicate within this run -> drop\n  seen.add(email);\n  out.push({ json: {\n    Business_Name: p.title || '', Website: p.website || '', Email: email,\n    Category: p.categoryName || '', Rating: (p.totalScore != null ? p.totalScore : ''),\n    Review_Count: (p.reviewsCount != null ? p.reviewsCount : ''), Address: p.address || ''\n  }});\n}\nreturn out;\n"
+      },
+      "id": "d80e5a91-9fd9-4a39-801e-6721ca482fff",
+      "name": "Prepare Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.Website }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "19e00f25-de6e-4be6-ade2-cfd1126faa8c",
+      "name": "Fetch Website",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5728,
+        912
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-5.2\", response_format: { type: \"json_object\" }, messages: [{ role: \"system\", content: \"You are a B2B sales analyst for YourBrand AI, which sells UK dental clinics a 24/7 AI assistant that answers enquiries, qualifies leads and books appointments - capturing the missed calls and web enquiries clinics normally lose. Analyze the clinic and reply ONLY with strict minified JSON, no extra text.\" }, { role: \"user\", content: \"Clinic: \" + $('Prepare Leads').item.json.Business_Name + \" | Website: \" + $('Prepare Leads').item.json.Website + \" | Category: \" + $('Prepare Leads').item.json.Category + \" | Google rating: \" + $('Prepare Leads').item.json.Rating + \" (\" + $('Prepare Leads').item.json.Review_Count + \" reviews) | Address: \" + $('Prepare Leads').item.json.Address + \"\\n\\nWebsite text (EMPTY if the site could not be read): \" + ($json.data || \"\").toString().replace(/<script[\\s\\S]*?<\\/script>/gi,\"\").replace(/<style[\\s\\S]*?<\\/style>/gi,\"\").replace(/<[^>]+>/g,\" \").replace(/\\s+/g,\" \").slice(0,2500) + \"\\n\\nReturn STRICT minified JSON with EXACTLY these keys:\\nlead_skoru (integer 0-100). SCORING RULES, be STRICT (do NOT give everyone a high score): if the website text above is EMPTY, cap the score at 45 (we could not verify). Score UNDER 40 if the text shows they ALREADY have a live chat / AI assistant / online booking widget, OR it is a large chain or corporate group, OR there are very few reviews. Score 70+ ONLY if ALL of: independent mid-size clinic, solid review count (real patient volume), AND no sign of online booking / live chat / AI (they rely on phone or email only).\\nzafiyet_ozeti (ONE honest short English sentence on the real gap; if the site could not be read, honestly say the site could not be read instead of inventing a weakness).\\nodak_tedaviler (their main treatments in English, e.g. Implants, Invisalign).\\nikna_cumlesi (ONE punchy, personalized English cold-email opening line to the owner: praise something specific such as their strong reviews, then point out that WITHOUT an instant 24/7 assistant they likely lose enquiries and missed calls to faster-responding clinics. Focus on SPEED and capturing MISSED enquiries/calls - do NOT mention 'after-midnight' or 'emergencies'. No greeting, just the single sentence.)\\nzafiyet_dogrulandi (boolean, true or false - THIS IS THE MOST IMPORTANT FIELD). Set it to TRUE only if the website text above contained real, human-readable content AND your gap_summary is based on something you actually READ there. Set it to FALSE if the website text was empty, truncated, or mostly CSS / JavaScript / tracking / schema code, or if you are inferring the weakness rather than seeing it. BE BRUTALLY HONEST here - false is NOT a failure. We use this flag to decide how to contact them: if it is false we will ASK them a question instead of claiming a fault, so a wrong TRUE makes us look like we never looked at their site. When in doubt, use false.\" }] }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "0b7f059f-f77b-406b-b225-695bbc7a7a5b",
+      "name": "OpenAI (Qualify)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6176,
+        912
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "let ai = {};\ntry { ai = JSON.parse($json.choices[0].message.content); } catch (e) { ai = {}; }\nconst c = $('Prepare Leads').item.json;\nreturn { json: {\n  Business_Name: c.Business_Name,\n  Website: c.Website,\n  Email: c.Email,\n  Status: 'Awaiting Email',\n  opening_line: ai.opening_line || '',\n  main_treatments: ai.main_treatments || '',\n  gap_summary: ai.gap_summary || '',\n  Lead_Score: (ai.lead_score != null ? ai.lead_score : ''),\n  Gap_Verified: (ai.gap_verified === true ? 'YES' : 'NO')\n} };"
+      },
+      "id": "c702642c-9670-4606-8d1f-f98dc7911c38",
+      "name": "Merge Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6400,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Business_Name": "={{ $json.Business_Name }}",
+            "Website": "={{ $json.Website }}",
+            "Email": "={{ $json.Email }}",
+            "Status": "={{ $json.Status }}",
+            "opening_line": "={{ $json.opening_line }}",
+            "main_treatments": "={{ $json.main_treatments }}",
+            "gap_summary": "={{ $json.gap_summary }}",
+            "Lead_Score": "={{ $json.Lead_Score }}",
+            "Gap_Verified": "={{ $json.Gap_Verified }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Business_Name",
+              "displayName": "Business_Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Website",
+              "displayName": "Website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Email",
+              "displayName": "Email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "opening_line",
+              "displayName": "opening_line",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "main_treatments",
+              "displayName": "main_treatments",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "gap_summary",
+              "displayName": "gap_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Lead_Score",
+              "displayName": "Lead_Score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Thread_ID",
+              "displayName": "Thread_ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Sent_Date",
+              "displayName": "Sent_Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Sender_Account",
+              "displayName": "Sender_Account",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            },
+            {
+              "id": "Message_ID",
+              "displayName": "Message_ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Followup_Count",
+              "displayName": "Followup_Count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Gap_Verified",
+              "displayName": "Gap_Verified",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "83d31574-ee29-4a0a-85b0-87f460898d6a",
+      "name": "Google Sheets (Append)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        6608,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\nconst rows = $input.all().map(i => i.json);\nconst n = rows.length;\nconst valid = rows.filter(r => r.Lead_Score !== '' && !isNaN(Number(r.Lead_Score)));\nconst scores = valid.map(r => Number(r.Lead_Score));\nconst avg = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 0;\nconst high = valid.filter(r => Number(r.Lead_Score) >= 80).length;\nconst sorted = valid.slice().sort((a,b)=>Number(b.Lead_Score)-Number(a.Lead_Score));\nconst top3 = sorted.slice(0,3).map((r,i)=> (i+1)+'. '+esc(r.Business_Name)+' · '+r.Lead_Score).join('\\n');\nconst months = ['January','February','March','April','May','June','July','August','September','October','November','December'];\nconst d = new Date();\nconst date = d.getDate()+' '+months[d.getMonth()]+' '+d.getFullYear();\nconst text =\n  '<b>YourBrand — Daily Lead Report</b>\\n' + date + '\\n' +\n  '──────────────\\n' +\n  'New qualified clinics: <b>' + n + '</b>\\n' +\n  'Average lead score: <b>' + avg + '/100</b>\\n' +\n  'High potential (80+): <b>' + high + '</b>\\n\\n' +\n  '<b>Top opportunities</b>\\n' + (top3 || '—') + '\\n' +\n  '──────────────\\n' +\n  'Status: all \"Awaiting Email\", handed to the outreach workflow';\nreturn [{ json: { report: text, count: n } }];"
+      },
+      "id": "81fc50fd-3e38-43e8-86c1-350212b33679",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6832,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "cb890550-267e-4a26-91b2-e8f6192e66b4",
+      "name": "Telegram (Daily Report)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        7056,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "removeItemsSeenInPreviousExecutions",
+        "dedupeValue": "={{ $('Prepare Leads').item.json.Email }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 2,
+      "position": [
+        5952,
+        912
+      ],
+      "id": "554d482f-ab3e-497f-a65b-2e1d241fbda4",
+      "name": "Remove Duplicates"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Daily city + search-term rotation so the lead pool never runs dry (60 cities x 4 terms = 240 combinations, ~8 months fresh)\nconst cities = [\n  \"Manchester\",\n  \"Birmingham\",\n  \"Leeds\",\n  \"Liverpool\",\n  \"Sheffield\",\n  \"Bristol\",\n  \"Nottingham\",\n  \"Leicester\",\n  \"Newcastle upon Tyne\",\n  \"Southampton\",\n  \"Portsmouth\",\n  \"Brighton\",\n  \"Reading\",\n  \"Coventry\",\n  \"Bradford\",\n  \"Cardiff\",\n  \"Glasgow\",\n  \"Edinburgh\",\n  \"Bournemouth\",\n  \"Milton Keynes\",\n  \"London\",\n  \"Croydon\",\n  \"Watford\",\n  \"Luton\",\n  \"Slough\",\n  \"Oxford\",\n  \"Cambridge\",\n  \"Norwich\",\n  \"Ipswich\",\n  \"Peterborough\",\n  \"Northampton\",\n  \"Derby\",\n  \"Stoke-on-Trent\",\n  \"Wolverhampton\",\n  \"Telford\",\n  \"Worcester\",\n  \"Gloucester\",\n  \"Swindon\",\n  \"Exeter\",\n  \"Plymouth\",\n  \"Bath\",\n  \"Cheltenham\",\n  \"Guildford\",\n  \"Maidstone\",\n  \"Chelmsford\",\n  \"Colchester\",\n  \"Southend-on-Sea\",\n  \"Hull\",\n  \"York\",\n  \"Middlesbrough\",\n  \"Sunderland\",\n  \"Doncaster\",\n  \"Wakefield\",\n  \"Huddersfield\",\n  \"Preston\",\n  \"Bolton\",\n  \"Warrington\",\n  \"Chester\",\n  \"Swansea\",\n  \"Newport\",\n  \"Aberdeen\"\n];\nconst terms = [\"dental clinic\",\"dentist\",\"dental practice\",\"private dentist\"];\nconst d = new Date();\nconst start = new Date(d.getFullYear(), 0, 0);\nconst dayOfYear = Math.floor((d - start) / 86400000);\nconst city = cities[dayOfYear % cities.length];\nconst term = terms[Math.floor(dayOfYear / cities.length) % terms.length];\nreturn [{ json: { city: city + \", United Kingdom\", term: term, day: dayOfYear } }];\n"
+      },
+      "id": "8965182d-5748-43d8-b299-e1fce1117fd3",
+      "name": "Pick City & Term",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5072,
+        912
+      ]
+    }
+  ],
+  "connections": {
+    "Every Morning 06:00": {
+      "main": [
+        [
+          {
+            "node": "Pick City & Term",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apify (Find Clinics)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Leads": {
+      "main": [
+        [
+          {
+            "node": "Fetch Website",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Website": {
+      "main": [
+        [
+          {
+            "node": "Remove Duplicates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI (Qualify)": {
+      "main": [
+        [
+          {
+            "node": "Merge Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Result": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets (Append)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets (Append)": {
+      "main": [
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report": {
+      "main": [
+        [
+          {
+            "node": "Telegram (Daily Report)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remove Duplicates": {
+      "main": [
+        [
+          {
+            "node": "OpenAI (Qualify)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick City & Term": {
+      "main": [
+        [
+          {
+            "node": "Apify (Find Clinics)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
